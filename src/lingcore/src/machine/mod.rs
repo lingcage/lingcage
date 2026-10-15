@@ -147,6 +147,9 @@ pub enum Error {
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
     Channel(#[source] std::io::Error),
+    /// `Channel::cid` is reserved by vsock or takes more than 32 bits.
+    #[error("context id {0} is outside 3 to 4294967294")]
+    ContextId(u64),
     /// Failed to create pcap file of the network link.
     #[error("failed to create pcap file")]
     Pcap(#[source] std::io::Error),
@@ -803,6 +806,13 @@ impl<H: Hypervisor> Machine<H> {
         let devices = usize::from(virtio_count(config));
         if devices > VIRTIO_DEVICES {
             return Err(Error::TooManyDevices(devices));
+        }
+        if let Some(channel) = &config.channel {
+            // Vsock reserves ids under 3 and u32::MAX. A guest keeps 32 bits
+            // of its id.
+            if !(3..u64::from(u32::MAX)).contains(&channel.cid) {
+                return Err(Error::ContextId(channel.cid));
+            }
         }
         let assembled = Instant::now();
         let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
@@ -1751,6 +1761,44 @@ mod tests {
                 Machine::new(&hv, &config, Vec::new()),
                 Err(Error::TooManyDisks(_))
             ));
+        }
+    }
+
+    #[test]
+    fn test_reject_context_id_outside_vsock_range() {
+        // Ids 3 and u32::MAX - 1 are taken, the ids beyond them refused.
+        #[cfg(all(feature = "kvm", target_os = "linux"))]
+        {
+            use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+            let hv = KvmHv::new().expect("open /dev/kvm");
+            for (cid, refused) in [
+                (0, true),
+                (2, true),
+                (3, false),
+                (4294967294, false),
+                (4294967295, true),
+                (u64::MAX, true),
+            ] {
+                let config = Config {
+                    vcpus: 1,
+                    cmdline: String::new(),
+                    confine: None,
+                    kernel: PathBuf::from("/nonexistent/kernel"),
+                    memory: 16 << 20,
+                    channel: Some(Channel {
+                        cid,
+                        ports: Ports::Named(Vec::new()),
+                    }),
+                    ..Default::default()
+                };
+                let outcome = Machine::new(&hv, &config, Vec::new());
+                assert_eq!(
+                    matches!(outcome, Err(Error::ContextId(_))),
+                    refused,
+                    "{cid}"
+                );
+            }
         }
     }
 

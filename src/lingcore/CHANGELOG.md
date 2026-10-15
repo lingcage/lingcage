@@ -76,3 +76,5 @@
 - \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix socket left behind by `Named`: the
   socket of a port bound for `--vsock` is removed once the endpoint is dropped, so a later run binds
   the same path.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix context id taken outside the vsock
+  range: a guest given an id under 3 or from `u32::MAX` up is refused with `Error::ContextId`.
