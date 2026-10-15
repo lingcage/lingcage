@@ -286,6 +286,25 @@ fn child_main(spec: &Spec, argv: &[*const libc::c_char]) -> ! {
             die(spec, &spec.program, "could not set controlling terminal");
         }
     }
+    // Restore the dispositions a command should start with. A launcher which
+    // starts the agent as a background job of a non-interactive shell leaves
+    // it with SIGINT and SIGQUIT ignored, and the Rust runtime ignores SIGPIPE
+    // for itself. An ignored disposition survives `execve`, so a command would
+    // start with all three ignored: the Ctrl-C a terminal's line discipline
+    // delivers to it would be discarded, and a reader which has gone would
+    // leave it with `EPIPE` where another program dies of SIGPIPE. Restored
+    // whatever the launch was, since these are the dispositions of a command,
+    // and one which arrives caught is reset by the exec anyway.
+    for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGPIPE] {
+        // SAFETY: setting a disposition to the default takes no pointer.
+        if unsafe { libc::signal(sig, libc::SIG_DFL) } == libc::SIG_ERR {
+            die(
+                spec,
+                &spec.program,
+                "could not restore a signal disposition",
+            );
+        }
+    }
     if let Some(cwd) = &spec.cwd {
         // SAFETY: `cwd` is a valid C string.
         if unsafe { libc::chdir(cwd.as_ptr()) } == -1 {
@@ -378,9 +397,19 @@ fn deny_vsock() -> io::Result<()> {
 }
 
 /// Report `what` on fd 2 and errno on the report pipe, then exit the
-/// child with code 127.
+/// child with code 127. The errno reaches the pipe whatever the
+/// disposition of `SIGPIPE` is, since a caller which dies of it reports
+/// nothing at all.
 fn die(spec: &Spec, program: &CString, what: &str) -> ! {
     let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    // A command's dispositions are restored before the exec, so SIGPIPE is at
+    // its default by the time a failure is reported, and a write to a reader
+    // which has gone would kill this process before the errno is written. The
+    // pipe would then read as a successful exec and the host would be told a
+    // command started which never did. Nothing needs the disposition after
+    // this, `_exit` follows.
+    // SAFETY: ignoring a signal takes no pointer.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     let line = format!("lingcage-agent: {}: {what}\n", program.to_string_lossy());
     // SAFETY: pointer and length of `line` are valid.
     unsafe { libc::write(2, line.as_ptr().cast::<libc::c_void>(), line.len()) };
@@ -515,14 +544,17 @@ fn cstring(text: &str, what: &str) -> Result<CString, SpawnError> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::ffi::CString;
     use std::fs::File;
     use std::io::{self, Read, Write};
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use crate::agent::exec::{SpawnError, deny_vsock, report_pipe, reported, start};
+    use crate::agent::exec::{
+        SpawnError, Spec, child_main, deny_vsock, report_pipe, reported, start,
+    };
     use crate::lcp::{Exec, Failure, Stream};
 
     /// Create stream pairs for given ports. Agent ends are returned via the
@@ -611,6 +643,104 @@ mod tests {
             Err(other) => panic!("expected Failed error, got {other:?}"),
             Ok(_) => panic!("nonexistent program started"),
         }
+    }
+
+    /// Returns an open `/dev/null` for the descriptors of a spec.
+    fn devnull() -> File {
+        File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null")
+    }
+
+    /// Returns `spec` with the argv `child_main` takes, built before a fork so
+    /// the child allocates nothing but its own.
+    fn argv_of<'a>(spec: &'a Spec, ends: &'a [*const libc::c_char]) -> Vec<*const libc::c_char> {
+        let mut argv = Vec::with_capacity(spec.args.len() + 2);
+        argv.push(spec.program.as_ptr());
+        argv.extend(spec.args.iter().map(|arg| arg.as_ptr()));
+        argv.extend_from_slice(ends);
+        argv
+    }
+
+    #[test]
+    fn test_command_gets_its_own_signal_dispositions() {
+        // The agent is started as a background job of a non-interactive shell,
+        // which leaves SIGINT ignored, and an ignored disposition survives
+        // `execve`. A command which inherits it discards the SIGINT a terminal
+        // delivers: the shell below sends itself SIGINT and dies of it, where
+        // one which kept the disposition goes on to `exit 99`.
+        let null = devnull();
+        let spec = Spec {
+            program: CString::new("/bin/sh").expect("program"),
+            args: vec![
+                CString::new("-c").expect("argument"),
+                CString::new("kill -INT $$; exit 99").expect("argument"),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            stdio: [null.as_raw_fd(); 3],
+            controlling: false,
+            report: None,
+        };
+        let argv = argv_of(&spec, &[std::ptr::null()]);
+        // SAFETY: fork has no pointer argument.
+        let pid = unsafe { libc::fork() };
+        assert_ne!(pid, -1, "fork");
+        if pid == 0 {
+            // The disposition a command of an agent started as a background
+            // job inherits.
+            // SAFETY: ignoring a signal takes no pointer.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+            child_main(&spec, &argv);
+        }
+        let status = reap(pid);
+        assert!(
+            libc::WIFSIGNALED(status),
+            "the command was not killed by a signal, status {status}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGINT,
+            "the command did not die of the SIGINT it sent itself"
+        );
+    }
+
+    #[test]
+    fn test_failed_exec_reported_with_stderr_closed() {
+        // `die` reports the errno after writing to fd 2, and the dispositions
+        // of a command are restored before the exec, so SIGPIPE is at its
+        // default there. A reader which has gone must not end the report:
+        // EOF on the pipe is read as a successful exec, and the host would be
+        // told a command started which never did.
+        let (stderr, gone) = UnixStream::pair().expect("socket pair");
+        drop(gone);
+        let null = devnull();
+        let (report_read, report_write) = report_pipe().expect("pipe");
+        let spec = Spec {
+            program: CString::new("/nonexistent/lingcage-command").expect("program"),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            stdio: [null.as_raw_fd(), null.as_raw_fd(), stderr.as_raw_fd()],
+            controlling: false,
+            report: Some(report_write.as_raw_fd()),
+        };
+        let argv = argv_of(&spec, &[std::ptr::null()]);
+        // SAFETY: fork has no pointer argument.
+        let pid = unsafe { libc::fork() };
+        assert_ne!(pid, -1, "fork");
+        if pid == 0 {
+            child_main(&spec, &argv);
+        }
+        drop(report_write);
+        let failed = reported(&report_read)
+            .expect("read report")
+            .expect("a failed exec was reported as a successful one");
+        assert_eq!(failed.reason, Failure::NotFound);
+        assert_eq!(failed.errno, libc::ENOENT);
+        assert_eq!(reap(pid), 127 << 8);
     }
 
     #[test]
