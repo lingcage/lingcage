@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use lingcore::hv::backend::kvm::hypervisor::KvmHv;
-use lingcore::machine::{Channel, Config, Machine};
+use lingcore::machine::{Channel, Config, Machine, Ports};
 use lingcore::seccomp::Refusal;
 
 use crate::error::{Error, Result};
@@ -243,8 +243,7 @@ impl TemplateStore {
             ports: Vec::new(),
             channel: Some(Channel {
                 cid,
-                at: prefix,
-                ..Default::default()
+                ports: Ports::Prefix(prefix),
             }),
             network: None,
             confine: Some(Refusal::Trap),

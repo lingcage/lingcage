@@ -32,7 +32,7 @@ mod imp {
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
     use lingcore::machine::{
-        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Rate, Share, control,
+        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Ports, Rate, Share, control,
     };
     use lingcore::seccomp::Refusal;
 
@@ -661,16 +661,19 @@ mod imp {
                 let (cid, prefix) = parse_channel(text).map_err(usage_err)?;
                 // Ports are served over the prefix or over sockets of
                 // `--vsock`, one of the two.
-                if prefix.is_some() && !vsock.is_empty() {
-                    return Err(usage_err(
-                        "--vsock needs --channel without a prefix".to_string(),
-                    ));
-                }
-                Some(Channel {
-                    cid,
-                    at: prefix.unwrap_or_default(),
-                    named: vsock,
-                })
+                let ports = match (prefix, vsock.is_empty()) {
+                    (Some(at), true) => Ports::Prefix(at),
+                    (None, false) => Ports::Named(vsock),
+                    (Some(_), false) => {
+                        return Err(usage_err(
+                            "--vsock needs --channel without a prefix".to_string(),
+                        ));
+                    }
+                    (None, true) => {
+                        return Err(usage_err("--channel needs a prefix or --vsock".to_string()));
+                    }
+                };
+                Some(Channel { cid, ports })
             }
             None if vsock.is_empty() => None,
             None => return Err(usage_err("--vsock needs --channel".to_string())),
@@ -1360,8 +1363,9 @@ mod imp {
                 .collect();
             let channel = config_of(&parse(&args).unwrap()).unwrap().channel.unwrap();
             assert_eq!(channel.cid, 3);
-            assert_eq!(channel.at, PathBuf::from("/run/vs"));
-            assert!(channel.named.is_empty());
+            assert!(
+                matches!(channel.ports, Ports::Prefix(at) if at == std::path::Path::new("/run/vs"))
+            );
             // Only the first `=` separates, a prefix may hold one.
             assert_eq!(
                 parse_channel("7=/run/a=b").unwrap(),
@@ -1372,8 +1376,7 @@ mod imp {
                 .map(|s| s.to_string())
                 .collect();
             let channel = config_of(&parse(&args).unwrap()).unwrap().channel.unwrap();
-            assert!(channel.at.as_os_str().is_empty());
-            assert_eq!(channel.named.len(), 1);
+            assert!(matches!(channel.ports, Ports::Named(ports) if ports.len() == 1));
         }
 
         #[test]
@@ -1402,6 +1405,7 @@ mod imp {
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "--verbose=2"],
                 vec!["--kernel", "k", "--balloon=1"],
+                vec!["--kernel", "k", "--channel", "3"],
                 vec!["--kernel", "k", "--channel", "3="],
                 vec!["--kernel", "k", "--channel", "3= "],
                 vec!["--kernel", "k", "--channel", "x=vs"],

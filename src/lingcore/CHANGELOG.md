@@ -49,6 +49,9 @@
   the thread holding the guest reads the signal pipe itself.
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Move console input onto holding thread:
   the thread holding the guest reads stdin itself.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] `Channel` takes `ports` in place of `at`
+  and `named`, breaking the 0.2.0 API.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] `--channel` needs a prefix or `--vsock`.
 
 ### Fixed
 

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use lingcore::hv::backend::kvm::hypervisor::KvmHv;
 use lingcore::hv::vcpu::VmExit;
-use lingcore::machine::{Channel, Config, Machine, State};
+use lingcore::machine::{Channel, Config, Machine, Ports, State};
 use lingcore::seccomp::Refusal;
 
 use crate::error::{Error, Result};
@@ -547,8 +547,7 @@ fn assemble(
         ports: Vec::new(),
         channel: Some(Channel {
             cid,
-            at: vsock_prefix.clone(),
-            ..Default::default()
+            ports: Ports::Prefix(vsock_prefix.clone()),
         }),
         network: None,
         confine: Some(Refusal::Trap),

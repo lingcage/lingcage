@@ -238,17 +238,23 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Vsock channel through which a guest is reached. Context id comes
 /// from the caller, one per guest it runs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Channel {
     /// Context id of the guest.
     pub cid: u64,
+    /// Host sockets the ports are reached over.
+    pub ports: Ports,
+}
+
+/// Host sockets the ports of a channel are reached over.
+#[derive(Debug, Clone)]
+pub enum Ports {
     /// Prefix of host socket paths. A port connects to `<prefix>_<port>`.
-    pub at: PathBuf,
-    /// Ports served on a socket the caller named, in place of one built
-    /// from the prefix. `Reach::Dial` opens that socket once the guest
-    /// reaches out, `Reach::Listen` binds it for connections reaching
-    /// in. An empty list leaves the prefix to serve them.
-    pub named: Vec<(u32, PathBuf, Reach)>,
+    Prefix(PathBuf),
+    /// Ports served on a socket the caller named. `Reach::Dial` opens that
+    /// socket once the guest reaches out, `Reach::Listen` binds it for
+    /// connections reaching in.
+    Named(Vec<(u32, PathBuf, Reach)>),
 }
 
 /// Host end of the network link of a guest.
@@ -878,17 +884,18 @@ impl<H: Hypervisor> Machine<H> {
             let _ = share;
         }
         if let Some(channel) = &config.channel {
-            let endpoint: Box<dyn Endpoint> = if channel.named.is_empty() {
-                Box::new(Sockets::listening(&channel.at).map_err(Error::Channel)?)
-            } else {
-                let mut named = Named::new();
-                for (port, at, reach) in &channel.named {
-                    match reach {
-                        Reach::Dial => named.dial(*port, at),
-                        Reach::Listen => named.listen(*port, at).map_err(Error::Channel)?,
+            let endpoint: Box<dyn Endpoint> = match &channel.ports {
+                Ports::Prefix(at) => Box::new(Sockets::listening(at).map_err(Error::Channel)?),
+                Ports::Named(ports) => {
+                    let mut named = Named::new();
+                    for (port, at, reach) in ports {
+                        match reach {
+                            Reach::Dial => named.dial(*port, at),
+                            Reach::Listen => named.listen(*port, at).map_err(Error::Channel)?,
+                        }
                     }
+                    Box::new(named)
                 }
-                Box::new(named)
             };
             devices.push(Box::new(Vsock::new(channel.cid, endpoint)));
         }
