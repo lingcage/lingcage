@@ -31,6 +31,9 @@
 - \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Add prefix to `--channel`: `CID=PREFIX`
   serves the ports over the socket PREFIX and over `PREFIX_<port>`, in place of the sockets of
   `--vsock`.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Add `Sockets::take_file` and
+  `Named::take_files`: the socket files come out of the endpoint as `SocketFile`, removed when
+  dropped, so a thread whose allowlist refuses stat and unlink can drop the endpoint.
 
 ### Changed
 

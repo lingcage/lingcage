@@ -105,7 +105,7 @@ impl Sockets {
     /// Create the endpoint like `new` does, and bind `prefix` itself for
     /// incoming connections. A name already bound is refused instead of
     /// unlinked, since it may belong to another guest. Socket is removed
-    /// with the endpoint.
+    /// with the endpoint, unless taken out by `take_file`.
     pub fn listening(prefix: impl Into<PathBuf>) -> io::Result<Self> {
         let prefix = prefix.into();
         let listener = Bound::new(&prefix)?;
@@ -114,6 +114,15 @@ impl Sockets {
             listener: Some(listener),
             arriving: Vec::new(),
         })
+    }
+
+    /// Take socket file out of endpoint, leaving its removal to the caller.
+    /// `None` once taken, or for an endpoint created by `new`.
+    pub fn take_file(&mut self) -> Option<SocketFile> {
+        match &mut self.listener {
+            Some(listener) => listener.socket.take(),
+            None => None,
+        }
     }
 
     /// Returns path of the socket for `port`.
@@ -232,11 +241,23 @@ impl Named {
 
     /// Serve `port` by binding `at` and handing the guest each connection
     /// taken there. A name already bound is refused, not unlinked. Socket
-    /// is removed with the endpoint.
+    /// is removed with the endpoint, unless taken out by `take_files`.
     pub fn listen(&mut self, port: u32, at: impl AsRef<Path>) -> io::Result<()> {
         let listener = Bound::new(at.as_ref())?;
         self.bound.push((port, listener));
         Ok(())
+    }
+
+    /// Take socket files of the bound ports out of endpoint, leaving their
+    /// removal to the caller.
+    pub fn take_files(&mut self) -> Vec<SocketFile> {
+        let mut files = Vec::new();
+        for (_, listener) in &mut self.bound {
+            if let Some(file) = listener.socket.take() {
+                files.push(file);
+            }
+        }
+        files
     }
 }
 
@@ -277,10 +298,17 @@ impl Endpoint for Named {
     }
 }
 
-/// Listener bound at a host path. Its socket file is removed with it,
-/// unless another process took the name over meanwhile.
+/// Listener bound at a host path, with its socket file, `None` once taken
+/// out of endpoint.
 struct Bound {
     listener: UnixListener,
+    socket: Option<SocketFile>,
+}
+
+/// Socket file an endpoint bound, removed on drop unless another process
+/// took the name over meanwhile. Removal takes stat and unlink, refused by
+/// allowlists of vCPU and device threads.
+pub struct SocketFile {
     at: PathBuf,
     /// Device and inode of the socket file, to tell it from one bound at
     /// the same name later.
@@ -298,8 +326,10 @@ impl Bound {
         let meta = std::fs::symlink_metadata(at)?;
         let bound = Bound {
             listener,
-            at: at.to_path_buf(),
-            file: (meta.dev(), meta.ino()),
+            socket: Some(SocketFile {
+                at: at.to_path_buf(),
+                file: (meta.dev(), meta.ino()),
+            }),
         };
         // Blocking accept would stall the thread which serves connections.
         bound.listener.set_nonblocking(true)?;
@@ -318,7 +348,7 @@ impl AsRawFd for Bound {
     }
 }
 
-impl Drop for Bound {
+impl Drop for SocketFile {
     fn drop(&mut self) {
         match std::fs::symlink_metadata(&self.at) {
             Ok(meta) if (meta.dev(), meta.ino()) == self.file => {
