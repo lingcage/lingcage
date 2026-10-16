@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use log::warn;
@@ -85,7 +86,7 @@ pub struct Sockets {
     prefix: PathBuf,
     /// Socket to accept incoming connections on. `None` for an endpoint
     /// created by `new`.
-    listener: Option<UnixListener>,
+    listener: Option<Bound>,
     /// Incoming connections with the line read so far. A line may arrive in
     /// pieces across calls to `incoming`.
     arriving: Vec<(UnixStream, Vec<u8>)>,
@@ -103,17 +104,25 @@ impl Sockets {
 
     /// Create the endpoint like `new` does, and bind `prefix` itself for
     /// incoming connections. A name already bound is refused instead of
-    /// unlinked, since it may belong to another guest.
+    /// unlinked, since it may belong to another guest. Endpoint leaves the
+    /// socket in place on drop, `names` gives it to the owner to remove.
     pub fn listening(prefix: impl Into<PathBuf>) -> io::Result<Self> {
         let prefix = prefix.into();
-        let listener = UnixListener::bind(&prefix)?;
-        // Blocking accept would stall the thread which serves connections.
-        listener.set_nonblocking(true)?;
+        let listener = Bound::new(&prefix)?;
         Ok(Sockets {
             prefix,
             listener: Some(listener),
             arriving: Vec::new(),
         })
+    }
+
+    /// Returns the socket file bound by `listening`, none for an endpoint
+    /// created by `new`.
+    pub fn names(&self) -> Vec<SocketName> {
+        self.listener
+            .iter()
+            .map(|bound| bound.name.clone())
+            .collect()
     }
 
     /// Returns path of the socket for `port`.
@@ -216,7 +225,7 @@ pub struct Named {
     /// Socket opened for each port the guest reaches out on.
     dialled: BTreeMap<u32, PathBuf>,
     /// Listener bound for each port the host process reaches in on.
-    bound: Vec<(u32, UnixListener)>,
+    bound: Vec<(u32, Bound)>,
 }
 
 impl Named {
@@ -231,13 +240,21 @@ impl Named {
     }
 
     /// Serve `port` by binding `at` and handing the guest each connection
-    /// taken there. A name already bound is refused, not unlinked.
+    /// taken there. A name already bound is refused, not unlinked. Endpoint
+    /// leaves the socket in place on drop, `names` gives it to the owner to
+    /// remove.
     pub fn listen(&mut self, port: u32, at: impl AsRef<Path>) -> io::Result<()> {
-        let listener = UnixListener::bind(at)?;
-        // Blocking accept would stall the thread which serves connections.
-        listener.set_nonblocking(true)?;
+        let listener = Bound::new(at.as_ref())?;
         self.bound.push((port, listener));
         Ok(())
+    }
+
+    /// Returns the socket files bound for the ports taken in.
+    pub fn names(&self) -> Vec<SocketName> {
+        self.bound
+            .iter()
+            .map(|(_, bound)| bound.name.clone())
+            .collect()
     }
 }
 
@@ -275,6 +292,74 @@ impl Endpoint for Named {
 
     fn acknowledges(&self) -> bool {
         false
+    }
+}
+
+/// Listener bound at a host path, with name of its socket file.
+struct Bound {
+    listener: UnixListener,
+    name: SocketName,
+}
+
+/// Socket file an endpoint bound. Endpoint leaves it in place on drop,
+/// since a vCPU or device thread may drop it last and their allowlists
+/// refuse stat and unlink. Its owner calls `remove`, a machine on drop.
+#[derive(Clone)]
+pub struct SocketName {
+    at: PathBuf,
+    /// Device and inode of the socket file, to tell it from one bound at
+    /// the same name later.
+    file: (u64, u64),
+}
+
+impl SocketName {
+    /// Remove the socket file, unless another process took the name over
+    /// meanwhile.
+    pub fn remove(&self) {
+        match std::fs::symlink_metadata(&self.at) {
+            Ok(meta) if (meta.dev(), meta.ino()) == self.file => {
+                if let Err(err) = std::fs::remove_file(&self.at) {
+                    warn!("socket {} not removed: {err}", self.at.display());
+                }
+            }
+            // Name bound by another process since, file is its own.
+            Ok(_) => warn!("socket {} taken over, left in place", self.at.display()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => warn!("socket {} not read: {err}", self.at.display()),
+        }
+    }
+}
+
+impl Bound {
+    /// Bind `at` for incoming connections.
+    fn new(at: &Path) -> io::Result<Self> {
+        // Empty name binds an abstract socket, with no file to remove.
+        if at.as_os_str().is_empty() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let listener = UnixListener::bind(at)?;
+        let meta = std::fs::symlink_metadata(at)?;
+        let name = SocketName {
+            at: at.to_path_buf(),
+            file: (meta.dev(), meta.ino()),
+        };
+        // Blocking accept would stall the thread which serves connections.
+        if let Err(err) = listener.set_nonblocking(true) {
+            name.remove();
+            return Err(err);
+        }
+        Ok(Bound { listener, name })
+    }
+
+    /// Accept connection waiting on the socket.
+    fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+        self.listener.accept()
+    }
+}
+
+impl AsRawFd for Bound {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
     }
 }
 
@@ -471,6 +556,55 @@ mod tests {
     }
 
     #[test]
+    fn test_socket_removed_by_name() {
+        let (sockets, path) = listening("removed");
+        let names = sockets.names();
+        drop(sockets);
+        assert!(path.exists(), "the drop removed the socket");
+        for name in &names {
+            name.remove();
+        }
+        assert!(!path.exists(), "the socket was not removed");
+        // Guest booted again binds the same name.
+        drop(Sockets::listening(&path).expect("bind the name again"));
+        std::fs::remove_file(&path).expect("remove the socket");
+    }
+
+    #[test]
+    fn test_socket_taken_over_kept() {
+        let (sockets, path) = listening("taken");
+        let names = sockets.names();
+        std::fs::remove_file(&path).expect("remove the socket");
+        let _other = UnixListener::bind(&path).expect("take the name over");
+        drop(sockets);
+        for name in &names {
+            name.remove();
+        }
+        assert!(path.exists(), "socket of another process was removed");
+        std::fs::remove_file(&path).expect("remove the socket");
+    }
+
+    #[test]
+    fn test_name_bound_by_another_kept() {
+        let path = unbound("held");
+        let _held = UnixListener::bind(&path).expect("bind the name first");
+        assert!(
+            Sockets::listening(&path).is_err(),
+            "a name already bound was taken"
+        );
+        assert!(path.exists(), "socket of another process was removed");
+        std::fs::remove_file(&path).expect("remove the socket");
+    }
+
+    #[test]
+    fn test_refuse_empty_name() {
+        assert!(
+            matches!(Sockets::listening(""), Err(err) if err.kind() == io::ErrorKind::InvalidInput),
+            "an empty prefix was bound"
+        );
+    }
+
+    #[test]
     fn test_acknowledge_with_port() {
         let (mut ours, mut theirs) = UnixStream::pair().expect("pair of ends");
         acknowledge(&mut ours, 4321).expect("acknowledge incoming connection");
@@ -531,6 +665,25 @@ mod named_tests {
         let (port, _stream) = named.incoming().expect("the connection was not taken");
         assert_eq!(port, 6000, "the connection landed on another port");
         assert!(!named.acknowledges(), "a named port answers a line");
+        let _ = std::fs::remove_dir_all(&at);
+    }
+
+    #[test]
+    fn test_bound_port_removed_by_name() {
+        let at = dir("removed");
+        let (bound, dialled) = (at.join("in"), at.join("out"));
+        let _listening = UnixListener::bind(&dialled).expect("bind the host end");
+        let mut named = Named::new();
+        named.listen(6000, &bound).expect("bind the port");
+        named.dial(6001, &dialled);
+        let names = named.names();
+        drop(named);
+        for name in &names {
+            name.remove();
+        }
+        assert!(!bound.exists(), "socket of the port is still there");
+        // Socket a port dials belongs to its listener.
+        assert!(dialled.exists(), "socket of another listener was removed");
         let _ = std::fs::remove_dir_all(&at);
     }
 

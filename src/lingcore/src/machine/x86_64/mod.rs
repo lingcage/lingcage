@@ -445,6 +445,79 @@ mod tests {
 
     #[cfg(all(feature = "kvm", target_os = "linux"))]
     #[test]
+    fn test_channel_sockets_go_with_machine() {
+        // Sockets of the channel go with the machine, or with its refusal.
+        use std::os::unix::net::UnixListener;
+
+        use crate::boot::bzimage::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&[0x0f, 0x0b]); // ud2
+        let image = std::env::temp_dir().join(format!("lingcore-channel-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+        let at = std::env::temp_dir().join(format!("lingcore-sockets-{}", std::process::id()));
+        std::fs::create_dir_all(&at).expect("make the directory");
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut config = Config {
+            vcpus: 1,
+            cmdline: String::new(),
+            confine: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            channel: Some(Channel {
+                cid: 3,
+                at: at.join("vs"),
+                named: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        assert!(at.join("vs").exists(), "the prefix was not bound");
+        drop(machine);
+        assert!(!at.join("vs").exists(), "the prefix was left behind");
+
+        // Assembly refused past the channel removes the prefix.
+        config.network = Some(Network {
+            link: Link::Socket(at.join("absent")),
+            mac: None,
+            pcap: None,
+            metadata: None,
+        });
+        assert!(Machine::new(&hv, &config, Vec::new()).is_err());
+        assert!(!at.join("vs").exists(), "a refused guest left its prefix");
+
+        // Refused port takes the ports bound before it along.
+        let _held = UnixListener::bind(at.join("held")).expect("bind the name first");
+        config.network = None;
+        config.channel = Some(Channel {
+            cid: 3,
+            at: PathBuf::new(),
+            named: vec![
+                (5000, at.join("first"), Reach::Listen),
+                (5001, at.join("held"), Reach::Listen),
+            ],
+        });
+        assert!(matches!(
+            Machine::new(&hv, &config, Vec::new()),
+            Err(Error::Channel(_))
+        ));
+        assert!(
+            !at.join("first").exists(),
+            "a port before the refused one was left"
+        );
+        assert!(
+            at.join("held").exists(),
+            "socket of another process was removed"
+        );
+
+        std::fs::remove_file(&image).expect("remove the kernel image");
+        std::fs::remove_dir_all(&at).expect("remove the directory");
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux"))]
+    #[test]
     fn test_dirty_capture_writes_marked_pages() {
         // First capture holds the pages the loader wrote. Marks are kept,
         // so the second holds the same. One more write adds that page.

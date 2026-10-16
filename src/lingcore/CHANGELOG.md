@@ -28,6 +28,12 @@
   readable once the guest is told to stop or loses a page of its RAM image.
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Add `Receive::try_receive`: bytes queued
   for the guest without waiting for a device held by another thread.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Add prefix to `--channel`: `CID=PREFIX`
+  serves the ports over the socket PREFIX and over `PREFIX_<port>`, in place of the sockets of
+  `--vsock`.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Add `Sockets::names` and `Named::names`:
+  socket files an endpoint bound, for its owner to remove with `SocketName::remove` on a thread
+  allowed to.
 
 ### Changed
 
@@ -65,3 +71,13 @@
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Fix orders waiting out the poll slice: the
   control thread wakes the thread holding the guest through an eventfd, so an order no longer waits
   up to 50 ms.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix socket left behind by `Sockets`: the
+  machine removes the socket of the prefix once dropped, and an empty prefix is refused.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix socket left behind by `Named`: the
+  socket of a port bound for `--vsock` is removed once the machine is dropped, so a later run binds
+  the same path.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix channel with no socket failing at
+  start: `--channel` with no prefix needs `--vsock`, refused as a usage error.
+- \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix context id taken outside the vsock
+  range: `--channel` refuses an id under 3 or from `u32::MAX` up, reserved by vsock or cut to 32
+  bits in the guest.

@@ -197,17 +197,18 @@ mod imp {
         },
         Flag {
             name: "channel",
-            value: "CID",
+            value: "CID[=PREFIX]",
             required: false,
             help: "give the guest a vsock channel under context id CID, reached over the sockets \
-                   named by --vsock",
+                   named by --vsock, or with PREFIX over the socket PREFIX, taking `CONNECT \
+                   <port>` from the host, and PREFIX_<port>, dialled for the guest",
         },
         Flag {
             name: "vsock",
             value: "PORT=PATH",
             required: false,
             help: "port of the vsock channel, its host end accepted on the socket at PATH or \
-                   dialled with dial:PATH, given once per port, needs --channel",
+                   dialled with dial:PATH, given once per port, needs --channel without PREFIX",
         },
         Flag {
             name: "control",
@@ -571,6 +572,33 @@ mod imp {
         })
     }
 
+    /// Parse `--channel`, `CID` or `CID=PREFIX`.
+    fn parse_channel(text: &str) -> std::result::Result<(u64, Option<PathBuf>), String> {
+        let (cid, prefix) = match text.split_once('=') {
+            Some((cid, prefix)) => (cid, Some(prefix)),
+            None => (text, None),
+        };
+        let cid: u64 = cid
+            .parse()
+            .map_err(|_| format!("invalid context id {cid}, use a number"))?;
+        // Vsock reserves ids under 3 and u32::MAX. A guest keeps 32 bits of
+        // its id.
+        if !(3..u64::from(u32::MAX)).contains(&cid) {
+            return Err(format!(
+                "invalid context id {cid}, use 3 to {}",
+                u32::MAX - 1
+            ));
+        }
+        match prefix {
+            // Blank prefix would bind sockets named by blanks.
+            Some(prefix) if prefix.trim().is_empty() => {
+                Err(format!("invalid channel {text}, prefix is empty"))
+            }
+            Some(prefix) => Ok((cid, Some(PathBuf::from(prefix)))),
+            None => Ok((cid, None)),
+        }
+    }
+
     /// Parse `--seccomp` mode, `None` means no allowlist.
     fn parse_seccomp(text: &str) -> std::result::Result<Option<Refusal>, String> {
         match text {
@@ -637,13 +665,28 @@ mod imp {
             vsock.push((port, PathBuf::from(at), reach));
         }
         let channel = match parsed.value("channel") {
-            Some(cid) => Some(Channel {
-                cid: cid
-                    .parse()
-                    .map_err(|_| usage_err(format!("invalid context id {cid}, use a number")))?,
-                named: vsock,
-                ..Default::default()
-            }),
+            Some(text) => {
+                let (cid, prefix) = parse_channel(text).map_err(usage_err)?;
+                // Ports are served over the prefix or over sockets of
+                // `--vsock`, one of the two.
+                let at = match (prefix, vsock.is_empty()) {
+                    (Some(at), true) => at,
+                    (None, false) => PathBuf::new(),
+                    (Some(_), false) => {
+                        return Err(usage_err(
+                            "--vsock needs --channel without a prefix".to_string(),
+                        ));
+                    }
+                    (None, true) => {
+                        return Err(usage_err("--channel needs a prefix or --vsock".to_string()));
+                    }
+                };
+                Some(Channel {
+                    cid,
+                    at,
+                    named: vsock,
+                })
+            }
             None if vsock.is_empty() => None,
             None => return Err(usage_err("--vsock needs --channel".to_string())),
         };
@@ -1325,6 +1368,32 @@ mod imp {
         }
 
         #[test]
+        fn test_channel_flag() {
+            let args: Vec<String> = ["--kernel", "k", "--channel", "3=/run/vs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let channel = config_of(&parse(&args).unwrap()).unwrap().channel.unwrap();
+            assert_eq!(channel.cid, 3);
+            assert_eq!(channel.at, PathBuf::from("/run/vs"));
+            assert!(channel.named.is_empty());
+            // Only the first `=` separates, a prefix may hold one.
+            assert_eq!(
+                parse_channel("7=/run/a=b").unwrap(),
+                (7, Some(PathBuf::from("/run/a=b")))
+            );
+            let args: Vec<String> = ["--kernel", "k", "--channel", "3", "--vsock", "1=/run/one"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let channel = config_of(&parse(&args).unwrap()).unwrap().channel.unwrap();
+            assert!(channel.at.as_os_str().is_empty());
+            assert_eq!(channel.named.len(), 1);
+            // Last id before u32::MAX is taken.
+            assert_eq!(parse_channel("4294967294=/run/vs").unwrap().0, 4294967294);
+        }
+
+        #[test]
         fn test_restore_takes_no_kernel() {
             let args: Vec<String> = ["--restore", "capture"]
                 .iter()
@@ -1350,6 +1419,13 @@ mod imp {
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "--verbose=2"],
                 vec!["--kernel", "k", "--balloon=1"],
+                vec!["--kernel", "k", "--channel", "3"],
+                vec!["--kernel", "k", "--channel", "3="],
+                vec!["--kernel", "k", "--channel", "3= "],
+                vec!["--kernel", "k", "--channel", "x=vs"],
+                vec!["--kernel", "k", "--channel", "2=vs"],
+                vec!["--kernel", "k", "--channel", "4294967295=vs"],
+                vec!["--kernel", "k", "--channel", "3=vs", "--vsock", "1=one"],
                 vec!["--kernel", "k", "-vx"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],

@@ -40,7 +40,7 @@ use crate::devices::virtio::net::metadata::Metadata;
 use crate::devices::virtio::net::pcap::Captured;
 use crate::devices::virtio::net::stack::{Stack, StackConfig};
 use crate::devices::virtio::vsock::device::Vsock;
-use crate::devices::virtio::vsock::host::{Endpoint, Named, Sockets};
+use crate::devices::virtio::vsock::host::{Endpoint, Named, SocketName, Sockets};
 use crate::devices::{Blob, Receive, Shared};
 use crate::hv::Interest;
 use crate::hv::hypervisor::Hypervisor;
@@ -448,6 +448,20 @@ struct Wired {
     ioeventfds: Vec<Arc<dyn IoeventFd>>,
 }
 
+/// Socket files bound by the vsock channel of a guest, removed on drop.
+/// It stays with the machine, so the drop runs on the thread holding it,
+/// not on a vCPU or device thread refusing stat and unlink.
+#[derive(Default)]
+struct ChannelSockets(Vec<SocketName>);
+
+impl Drop for ChannelSockets {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            name.remove();
+        }
+    }
+}
+
 /// Place `device` on `bus` in virtio register block `slot`, on the line
 /// the machine gives that slot, with one ioeventfd per queue bound on
 /// its `QUEUE_NOTIFY`.
@@ -714,6 +728,8 @@ pub struct Machine<H: Hypervisor> {
     /// Virtio devices, each with one ioeventfd per queue on its notify
     /// register.
     wired: Vec<Wired>,
+    /// Socket files of the vsock channel, held for the drop removing them.
+    _channel_sockets: ChannelSockets,
     /// The device thread once started, waiting on ioeventfds of each device.
     /// `Err` means an allowlist which failed to install.
     device_threads: Vec<JoinHandle<Result<()>>>,
@@ -877,17 +893,28 @@ impl<H: Hypervisor> Machine<H> {
             #[cfg(not(target_os = "linux"))]
             let _ = share;
         }
+        // Failed assembly drops it here and removes the sockets bound so far.
+        let mut channel_sockets = ChannelSockets::default();
         if let Some(channel) = &config.channel {
             let endpoint: Box<dyn Endpoint> = if channel.named.is_empty() {
-                Box::new(Sockets::listening(&channel.at).map_err(Error::Channel)?)
+                let sockets = Sockets::listening(&channel.at).map_err(Error::Channel)?;
+                channel_sockets.0.extend(sockets.names());
+                Box::new(sockets)
             } else {
                 let mut named = Named::new();
                 for (port, at, reach) in &channel.named {
                     match reach {
                         Reach::Dial => named.dial(*port, at),
-                        Reach::Listen => named.listen(*port, at).map_err(Error::Channel)?,
+                        Reach::Listen => {
+                            if let Err(err) = named.listen(*port, at) {
+                                // Ports bound before this one are removed.
+                                channel_sockets.0.extend(named.names());
+                                return Err(Error::Channel(err));
+                            }
+                        }
                     }
                 }
+                channel_sockets.0.extend(named.names());
                 Box::new(named)
             };
             devices.push(Box::new(Vsock::new(channel.cid, endpoint)));
@@ -960,6 +987,7 @@ impl<H: Hypervisor> Machine<H> {
             ram,
             devices: Devices(Arc::new(Mutex::new(bus))),
             wired,
+            _channel_sockets: channel_sockets,
             device_threads: Vec::new(),
             registry,
             console: Arc::new(uart),
@@ -1605,6 +1633,30 @@ impl StopHandle {
 #[cfg(test)]
 mod tests {
     use crate::machine::*;
+
+    #[test]
+    fn test_channel_endpoint_dropped_on_device_thread() {
+        // Device thread may drop the endpoint last. With `Trap` a stat or an
+        // unlink in the drop ends the test with `SIGSYS`.
+        let at = std::env::temp_dir().join(format!("lingcore-dropped-{}", std::process::id()));
+        let sockets = Sockets::listening(&at).expect("bind the channel socket");
+        let filter = Filter::new(
+            Thread::Device {
+                user_net: false,
+                fs: false,
+            },
+            Refusal::Trap,
+        )
+        .expect("assemble allowlist");
+        std::thread::spawn(move || {
+            filter.confine().expect("install allowlist");
+            drop(sockets);
+        })
+        .join()
+        .expect("drop on the device thread");
+        assert!(at.exists(), "the drop removed the socket");
+        std::fs::remove_file(&at).expect("remove the socket");
+    }
 
     #[test]
     fn test_hold_waits_for_all_threads() {
